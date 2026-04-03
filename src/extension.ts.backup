@@ -1,0 +1,557 @@
+import * as vscode from 'vscode';
+import * as path from 'path';
+
+export function activate(context: vscode.ExtensionContext) {
+    context.subscriptions.push(
+        PdfAnnotatorEditorProvider.register(context)
+    );
+}
+
+class PdfAnnotatorEditorProvider implements vscode.CustomReadonlyEditorProvider {
+    public static register(context: vscode.ExtensionContext): vscode.Disposable {
+        const provider = new PdfAnnotatorEditorProvider(context);
+        return vscode.window.registerCustomEditorProvider('pdfAnnotator.editor', provider, {
+            webviewOptions: {
+                retainContextWhenHidden: true,
+            },
+            supportsMultipleEditorsPerDocument: false,
+        });
+    }
+
+    constructor(private readonly context: vscode.ExtensionContext) {}
+
+    async openCustomDocument(
+        uri: vscode.Uri,
+        openContext: vscode.CustomDocumentOpenContext,
+        token: vscode.CancellationToken
+    ): Promise<vscode.CustomDocument> {
+        return { uri, dispose: () => {} };
+    }
+
+    async resolveCustomEditor(
+        document: vscode.CustomDocument,
+        webviewPanel: vscode.WebviewPanel,
+        token: vscode.CancellationToken
+    ): Promise<void> {
+        webviewPanel.webview.options = {
+            enableScripts: true,
+        };
+
+        // Read the PDF file
+        const pdfData = await vscode.workspace.fs.readFile(document.uri);
+        const pdfBase64 = Buffer.from(pdfData).toString('base64');
+
+        webviewPanel.webview.html = this.getHtmlForWebview(webviewPanel.webview, pdfBase64, document.uri);
+
+        // Handle messages from the webview
+        webviewPanel.webview.onDidReceiveMessage(async (message) => {
+            switch (message.type) {
+                case 'saveAnnotations':
+                    await this.saveAnnotatedPdf(document.uri, message.annotations, message.pdfData);
+                    vscode.window.showInformationMessage('Annotations saved successfully!');
+                    break;
+            }
+        });
+    }
+
+    private async saveAnnotatedPdf(uri: vscode.Uri, annotations: any, pdfData: string) {
+        try {
+            // Create a new file with annotations in the name
+            const dir = path.dirname(uri.fsPath);
+            const ext = path.extname(uri.fsPath);
+            const base = path.basename(uri.fsPath, ext);
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+            const newFileName = `${base}_annotated_${timestamp}${ext}`;
+            const newUri = vscode.Uri.file(path.join(dir, newFileName));
+
+            // Save annotations as JSON alongside the PDF
+            const annotationsFileName = `${base}_annotations_${timestamp}.json`;
+            const annotationsUri = vscode.Uri.file(path.join(dir, annotationsFileName));
+            
+            await vscode.workspace.fs.writeFile(
+                annotationsUri,
+                Buffer.from(JSON.stringify(annotations, null, 2))
+            );
+
+            // Copy the original PDF with a new name
+            const originalData = await vscode.workspace.fs.readFile(uri);
+            await vscode.workspace.fs.writeFile(newUri, originalData);
+
+            vscode.window.showInformationMessage(
+                `✓ Saved!\n${annotationsFileName}\n${newFileName}`
+            );
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to save: ${error}`);
+        }
+    }
+
+    private getHtmlForWebview(webview: vscode.Webview, pdfBase64: string, uri: vscode.Uri): string {
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Annotator</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+        #toolbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: #2d2d30;
+            padding: 10px;
+            display: flex;
+            gap: 10px;
+            z-index: 1000;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        #toolbar button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 13px;
+            transition: background 0.2s;
+        }
+        #toolbar button:hover {
+            background: #1177bb;
+        }
+        #toolbar button.active {
+            background: #1177bb;
+            box-shadow: inset 0 0 5px rgba(0,0,0,0.3);
+        }
+        #toolbar input[type="color"] {
+            width: 40px;
+            height: 35px;
+            border: none;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        #toolbar input[type="range"] {
+            width: 100px;
+        }
+        #toolbar label {
+            color: #cccccc;
+            font-size: 12px;
+        }
+        #toolbar select {
+            background: #3c3c3c;
+            color: white;
+            border: 1px solid #555;
+            padding: 6px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #container {
+            margin-top: 80px;
+            height: calc(100vh - 80px);
+            overflow: auto;
+            position: relative;
+            background: #1e1e1e;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 20px;
+        }
+        .canvas-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+        #pdfCanvas {
+            display: block;
+        }
+        #annotationCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            cursor: crosshair;
+        }
+        .stamp-menu {
+            position: fixed;
+            background: #2d2d30;
+            border: 1px solid #555;
+            border-radius: 4px;
+            padding: 8px;
+            z-index: 2000;
+            display: none;
+        }
+        .stamp-menu button {
+            display: block;
+            width: 100%;
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            margin: 4px 0;
+            cursor: pointer;
+            border-radius: 4px;
+            text-align: left;
+        }
+        .stamp-menu button:hover {
+            background: #1177bb;
+        }
+        .separator {
+            width: 1px;
+            height: 30px;
+            background: #555;
+        }
+    </style>
+</head>
+<body>
+    <div id="toolbar">
+        <button id="drawBtn" title="Draw">✏️ Draw</button>
+        <button id="highlightBtn" title="Highlight">🖍️ Highlight</button>
+        <button id="textBtn" title="Add Text">📝 Text</button>
+        <button id="stampBtn" title="Add Stamp">⭐ Stamp</button>
+        <button id="eraseBtn" title="Erase">🗑️ Erase</button>
+        <div class="separator"></div>
+        <input type="color" id="colorPicker" value="#ff0000" title="Color">
+        <label for="lineWidth">Width:</label>
+        <input type="range" id="lineWidth" min="1" max="20" value="3">
+        <span id="lineWidthValue" style="color: #ccc; min-width: 30px;">3</span>
+        <div class="separator"></div>
+        <button id="undoBtn" title="Undo (Ctrl+Z)">↶ Undo</button>
+        <button id="saveBtn">💾 Save</button>
+        <button id="clearBtn">🗑️ Clear</button>
+        <div class="separator"></div>
+        <label for="pageSelect">Page:</label>
+        <select id="pageSelect"></select>
+        <span style="color: #ccc; margin-left: auto; font-size: 12px;">${path.basename(uri.fsPath)}</span>
+    </div>
+    <div id="stampMenu" class="stamp-menu">
+        <button data-stamp="✓">✓ Check</button>
+        <button data-stamp="✗">✗ Cross</button>
+        <button data-stamp="★">★ Star</button>
+        <button data-stamp="→">→ Arrow</button>
+        <button data-stamp="⚠">⚠ Warning</button>
+        <button data-stamp="!">! Important</button>
+        <button data-stamp="?">? Question</button>
+    </div>
+    <div id="container">
+        <div class="canvas-wrapper">
+            <canvas id="pdfCanvas"></canvas>
+            <canvas id="annotationCanvas"></canvas>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        const vscode = acquireVsCodeApi();
+        const pdfData = 'data:application/pdf;base64,${pdfBase64}';
+        
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        let pdfDoc = null;
+        let pageNum = 1;
+        let pageRendering = false;
+        let pageNumPending = null;
+        let scale = 1.5;
+        let numPages = 0;
+        
+        const pdfCanvas = document.getElementById('pdfCanvas');
+        const annotationCanvas = document.getElementById('annotationCanvas');
+        const pdfCtx = pdfCanvas.getContext('2d');
+        const annotationCtx = annotationCanvas.getContext('2d');
+        
+        let currentTool = 'draw';
+        let isDrawing = false;
+        let annotations = [];
+        let undoStack = [];
+        let currentPath = [];
+        let currentColor = '#ff0000';
+        let currentLineWidth = 3;
+        let eraseMode = false;
+        
+        // Toolbar controls
+        document.getElementById('drawBtn').addEventListener('click', () => setTool('draw'));
+        document.getElementById('highlightBtn').addEventListener('click', () => setTool('highlight'));
+        document.getElementById('textBtn').addEventListener('click', () => setTool('text'));
+        document.getElementById('stampBtn').addEventListener('click', showStampMenu);
+        document.getElementById('eraseBtn').addEventListener('click', () => setTool('erase'));
+        document.getElementById('undoBtn').addEventListener('click', undo);
+        document.getElementById('saveBtn').addEventListener('click', saveAnnotations);
+        document.getElementById('clearBtn').addEventListener('click', clearAnnotations);
+        document.getElementById('colorPicker').addEventListener('change', (e) => {
+            currentColor = e.target.value;
+        });
+        document.getElementById('lineWidth').addEventListener('input', (e) => {
+            currentLineWidth = parseInt(e.target.value);
+            document.getElementById('lineWidthValue').textContent = currentLineWidth;
+        });
+        document.getElementById('pageSelect').addEventListener('change', (e) => {
+            pageNum = parseInt(e.target.value);
+            renderPage(pageNum);
+        });
+        
+        // Stamp menu
+        document.querySelectorAll('#stampMenu button').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const stamp = e.target.getAttribute('data-stamp');
+                currentTool = 'stamp';
+                currentStamp = stamp;
+                document.getElementById('stampMenu').style.display = 'none';
+                setTool('stamp');
+            });
+        });
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+                e.preventDefault();
+                undo();
+            }
+        });
+        
+        let currentStamp = '✓';
+        
+        function showStampMenu() {
+            const menu = document.getElementById('stampMenu');
+            const btn = document.getElementById('stampBtn');
+            const rect = btn.getBoundingClientRect();
+            menu.style.display = 'block';
+            menu.style.left = rect.left + 'px';
+            menu.style.top = (rect.bottom + 5) + 'px';
+        }
+        
+        // Close stamp menu when clicking elsewhere
+        document.addEventListener('click', (e) => {
+            const menu = document.getElementById('stampMenu');
+            const stampBtn = document.getElementById('stampBtn');
+            if (!menu.contains(e.target) && e.target !== stampBtn) {
+                menu.style.display = 'none';
+            }
+        });
+        
+        function undo() {
+            if (undoStack.length > 0) {
+                const lastAction = undoStack.pop();
+                // Remove the last annotation that matches the action
+                for (let i = annotations.length - 1; i >= 0; i--) {
+                    if (JSON.stringify(annotations[i]) === JSON.stringify(lastAction)) {
+                        annotations.splice(i, 1);
+                        break;
+                    }
+                }
+                redrawAnnotations();
+            }
+        }
+        
+        function setTool(tool) {
+            currentTool = tool;
+            document.querySelectorAll('#toolbar button').forEach(btn => btn.classList.remove('active'));
+            const btn = document.getElementById(tool + 'Btn');
+            if (btn) btn.classList.add('active');
+            
+            if (tool === 'highlight') {
+                annotationCtx.globalAlpha = 0.3;
+            } else {
+                annotationCtx.globalAlpha = 1.0;
+            }
+        }
+        
+        // Initialize with draw tool
+        setTool('draw');
+        
+        // Canvas drawing
+        annotationCanvas.addEventListener('mousedown', startDrawing);
+        annotationCanvas.addEventListener('mousemove', draw);
+        annotationCanvas.addEventListener('mouseup', stopDrawing);
+        annotationCanvas.addEventListener('mouseout', stopDrawing);
+        
+        function getMousePos(e) {
+            const rect = annotationCanvas.getBoundingClientRect();
+            return {
+                x: (e.clientX - rect.left) * (annotationCanvas.width / rect.width),
+                y: (e.clientY - rect.top) * (annotationCanvas.height / rect.height)
+            };
+        }
+        
+        function startDrawing(e) {
+            const pos = getMousePos(e);
+            
+            if (currentTool === 'text') {
+                const text = prompt('Enter text:');
+                if (text) {
+                    annotationCtx.font = '16px Arial';
+                    annotationCtx.fillStyle = currentColor;
+                    annotationCtx.globalAlpha = 1.0;
+                    annotationCtx.fillText(text, pos.x, pos.y);
+                    annotations.push({
+                        type: 'text',
+                        text: text,
+                        x: pos.x,
+                        y: pos.y,
+                        color: currentColor,
+                        page: pageNum
+                    });
+                }
+                return;
+            }
+            
+            if (currentTool === 'erase') {
+                // Find and remove annotation near this point
+                annotations = annotations.filter(a => {
+                    if (a.page !== pageNum) return true;
+                    if (a.type === 'text') {
+                        const dist = Math.sqrt((a.x - pos.x)**2 + (a.y - pos.y)**2);
+                        return dist > 20;
+                    }
+                    return true;
+                });
+                redrawAnnotations();
+                return;
+            }
+            
+            isDrawing = true;
+            currentPath = [pos];
+            annotationCtx.beginPath();
+            annotationCtx.moveTo(pos.x, pos.y);
+        }
+        
+        function draw(e) {
+            if (!isDrawing) return;
+            if (currentTool === 'text' || currentTool === 'erase') return;
+            
+            const pos = getMousePos(e);
+            currentPath.push(pos);
+            
+            annotationCtx.strokeStyle = currentColor;
+            annotationCtx.lineWidth = currentLineWidth;
+            annotationCtx.lineCap = 'round';
+            annotationCtx.lineJoin = 'round';
+            
+            if (currentTool === 'highlight') {
+                annotationCtx.globalAlpha = 0.3;
+            } else {
+                annotationCtx.globalAlpha = 1.0;
+            }
+            
+            annotationCtx.lineTo(pos.x, pos.y);
+            annotationCtx.stroke();
+        }
+        
+        function stopDrawing() {
+            if (!isDrawing) return;
+            isDrawing = false;
+            
+            if (currentPath.length > 0) {
+                annotations.push({
+                    type: currentTool,
+                    path: currentPath,
+                    color: currentColor,
+                    lineWidth: currentLineWidth,
+                    page: pageNum
+                });
+                currentPath = [];
+            }
+        }
+        
+        function saveAnnotations() {
+            vscode.postMessage({
+                type: 'saveAnnotations',
+                annotations: annotations,
+                pdfData: pdfData
+            });
+        }
+        
+        function clearAnnotations() {
+            if (confirm('Clear all annotations on this page?')) {
+                annotations = annotations.filter(a => a.page !== pageNum);
+                redrawAnnotations();
+            }
+        }
+        
+        function redrawAnnotations() {
+            annotationCtx.clearRect(0, 0, annotationCanvas.width, annotationCanvas.height);
+            
+            annotations.filter(a => a.page === pageNum).forEach(annotation => {
+                if (annotation.type === 'text') {
+                    annotationCtx.font = '16px Arial';
+                    annotationCtx.fillStyle = annotation.color;
+                    annotationCtx.globalAlpha = 1.0;
+                    annotationCtx.fillText(annotation.text, annotation.x, annotation.y);
+                } else {
+                    annotationCtx.strokeStyle = annotation.color;
+                    annotationCtx.lineWidth = annotation.lineWidth;
+                    annotationCtx.lineCap = 'round';
+                    annotationCtx.lineJoin = 'round';
+                    
+                    if (annotation.type === 'highlight') {
+                        annotationCtx.globalAlpha = 0.3;
+                    } else {
+                        annotationCtx.globalAlpha = 1.0;
+                    }
+                    
+                    annotationCtx.beginPath();
+                    annotation.path.forEach((point, index) => {
+                        if (index === 0) {
+                            annotationCtx.moveTo(point.x, point.y);
+                        } else {
+                            annotationCtx.lineTo(point.x, point.y);
+                        }
+                    });
+                    annotationCtx.stroke();
+                }
+            });
+            
+            // Reset alpha based on current tool
+            annotationCtx.globalAlpha = currentTool === 'highlight' ? 0.3 : 1.0;
+        }
+        
+        // Load PDF
+        pdfjsLib.getDocument(pdfData).promise.then(function(pdfDoc_) {
+            pdfDoc = pdfDoc_;
+            numPages = pdfDoc.numPages;
+            
+            // Populate page selector
+            const pageSelect = document.getElementById('pageSelect');
+            for (let i = 1; i <= numPages; i++) {
+                const option = document.createElement('option');
+                option.value = i;
+                option.textContent = \`Page \${i} of \${numPages}\`;
+                pageSelect.appendChild(option);
+            }
+            
+            renderPage(pageNum);
+        });
+        
+        function renderPage(num) {
+            pageRendering = true;
+            pdfDoc.getPage(num).then(function(page) {
+                const viewport = page.getViewport({ scale: scale });
+                pdfCanvas.height = viewport.height;
+                pdfCanvas.width = viewport.width;
+                annotationCanvas.height = viewport.height;
+                annotationCanvas.width = viewport.width;
+                
+                const renderContext = {
+                    canvasContext: pdfCtx,
+                    viewport: viewport
+                };
+                
+                page.render(renderContext).promise.then(function() {
+                    pageRendering = false;
+                    redrawAnnotations();
+                    if (pageNumPending !== null) {
+                        renderPage(pageNumPending);
+                        pageNumPending = null;
+                    }
+                });
+            });
+        }
+    </script>
+</body>
+</html>`;
+    }
+}
+
+export function deactivate() {}
