@@ -204,15 +204,28 @@ function undoCurrent(){const pg=visPg();if(!undoStacks[pg]||!undoStacks[pg].leng
 function clearCurrent(){const pg=visPg();saveUndo(pg);annotations[pg]=[];redraw(pg)}
 
 // Text
+let editingIdx=null; // index of annotation being edited (null = new text)
 function commitText(){
     if(!activeTextInput)return;
     const{el,pg,x,y}=activeTextInput;
     const text=el.value.trim();
-    if(text){saveUndo(pg);getAnns(pg).push({type:'text',text,x,y:y+fontSize,color,fontSize,fontFamily,page:pg});redraw(pg)}
-    el.remove();activeTextInput=null;
+    if(editingIdx!==null){
+        // Editing existing annotation
+        if(text){
+            saveUndo(pg);
+            const a=getAnns(pg)[editingIdx];
+            a.text=text;a.color=color;a.fontSize=fontSize;a.fontFamily=fontFamily;
+        }else{
+            saveUndo(pg);getAnns(pg).splice(editingIdx,1);
+        }
+        editingIdx=null;
+    }else{
+        if(text){saveUndo(pg);getAnns(pg).push({type:'text',text,x,y:y+fontSize,color,fontSize,fontFamily,page:pg})}
+    }
+    redraw(pg);el.remove();activeTextInput=null;
 }
-function spawnText(pg,cx,cy){
-    commitText();
+function spawnText(pg,cx,cy,existingText,existingIdx){
+    commitText();clearSelection();
     const wrap=pageCanvases[pg].wrap,dc=pageCanvases[pg].draw;
     const r=dc.getBoundingClientRect();
     const sx=r.width/dc.width,sy=r.height/dc.height;
@@ -221,13 +234,24 @@ function spawnText(pg,cx,cy){
     input.style.left=(cx*sx)+'px';input.style.top=(cy*sy)+'px';
     input.style.fontSize=fontSize+'px';input.style.fontFamily=fontFamily;input.style.color=color;
     input.style.lineHeight='1.2';
+    if(existingText){input.value=existingText;editingIdx=existingIdx}else{editingIdx=null}
     input.addEventListener('input',()=>{input.style.height='auto';input.style.height=input.scrollHeight+'px';input.style.width=Math.max(100,input.scrollWidth+10)+'px'});
     input.addEventListener('keydown',e=>{
-        if(e.key==='Escape'){e.preventDefault();input.value='';commitText()}
+        if(e.key==='Escape'){e.preventDefault();input.value=existingText||'';commitText()}
     });
     wrap.appendChild(input);
-    requestAnimationFrame(()=>input.focus());
+    requestAnimationFrame(()=>{input.focus();if(existingText){input.style.height='auto';input.style.height=input.scrollHeight+'px';input.style.width=Math.max(100,input.scrollWidth+10)+'px'}});
     activeTextInput={el:input,pg,x:cx,y:cy};
+}
+function editTextAnnotation(pg,idx){
+    const a=getAnns(pg)[idx];if(!a||a.type!=='text')return;
+    // Set toolbar to match the annotation's style
+    color=a.color||'#000';fontSize=a.fontSize||16;fontFamily=a.fontFamily||'Arial';
+    document.getElementById('color').value=color;
+    document.getElementById('fontSize').value=fontSize;
+    document.getElementById('fontFamily').value=fontFamily;
+    // Position the textarea at the annotation's canvas position, offset back by fontSize for baseline
+    spawnText(pg,a.x,a.y-a.fontSize,a.text,idx);
 }
 
 // Selection
@@ -285,6 +309,11 @@ function getPos(e,pg){const c=pageCanvases[pg].draw,r=c.getBoundingClientRect();
 
 function setupPage(pg){
     const dc=pageCanvases[pg].draw,ctx=dc.getContext('2d');
+    dc.addEventListener('dblclick',e=>{
+        const pos=getPos(e,pg);
+        const hit=hitTest(pg,pos);
+        if(hit&&hit.ann.type==='text'){e.preventDefault();editTextAnnotation(pg,hit.idx)}
+    });
     dc.addEventListener('mousedown',e=>{
         const pos=getPos(e,pg);
         if(tool==='text'){spawnText(pg,pos.x,pos.y);return}
